@@ -33,13 +33,6 @@ class LaplaceEquation(nn.Module):
         flags_DATA = bc_flag.unsqueeze(-1)
         flags_NUM = bc_flag.sum(1, keepdim=True).unsqueeze(-1)
         
-        print("NORMAL")
-        print(bc_flag)
-        print("UNSQUEEZED")
-        print(flags_DATA)
-        print("FLAG_NUM")
-        print(flags_NUM)
-        
         geometry_encoder = self.point_NET(bc_pts[:,:,:2]) # Only coords
         geometry_encoder = (geometry_encoder * flags_DATA).sum(1, keepdim=True) / flags_NUM.clamp(min = 1e-6)
 
@@ -51,32 +44,36 @@ class LaplaceEquation(nn.Module):
         return (branch_encoder * trunk_encoder).sum(-1, keepdim=True) + self.bias
 
 
-def make_random_blob_mask(grid_size, n_blob_pts=8, with_hole=True):
+def blob(X, Y, cx, cy, base_r, n_pts):
+    angles = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
+    random_radius = np.clip(base_r * (1 + 0.3 * np.random.randn(n_pts)), 0.15, 0.45)
+
+    theta = np.arctan2(Y-cy, X-cx)
+    if (theta < 0.0):
+        theta += 2 * np.pi
+
+    r_interp = np.interp(theta.ravel(), np.append(angles, angles[0] + 2 * np.pi),
+                         np.append(random_radius, random_radius[0])).reshape(grid_size, grid_size)
+    
+    dist = np.sqrt((X-cx)**2 + (Y-cy)**2)
+    return dist <= r_interp # Blob == 1
+
+def make_random_blob_mask(grid_size, n_blob_pts=8):
     x = np.linspace(0, 1, grid_size)
     X, Y = np.meshgrid(x, x)
 
-    def blob(cx, cy, base_r, n_pts):
-        angles = np.linspace(0, 2*np.pi, n_pts, endpoint=False)
-        radii = np.clip(base_r * (1 + 0.3*np.random.randn(n_pts)), 0.15, 0.45)
-        theta = np.arctan2(Y-cy, X-cx) % (2*np.pi)
-        r_interp = np.interp(theta.ravel(), np.append(angles, angles[0]+2*np.pi),
-                              np.append(radii, radii[0])).reshape(grid_size, grid_size)
-        dist = np.sqrt((X-cx)**2 + (Y-cy)**2)
-        return dist <= r_interp
-
     cx, cy = np.random.uniform(0.4, 0.6, 2)
     outer_r = np.random.uniform(0.3, 0.45)
-    mask = blob(cx, cy, outer_r, n_blob_pts)
+    mask = blob(X, Y, cx, cy, outer_r, n_blob_pts)
 
-    if with_hole:
-        hole_r = outer_r * np.random.uniform(0.25, 0.4)
-        hole_cx = cx + np.random.uniform(-0.03, 0.03)
-        hole_cy = cy + np.random.uniform(-0.03, 0.03)
-        hole = blob(hole_cx, hole_cy, hole_r, n_pts=6)
-        mask = mask & (~hole)
+
+    hole_r = outer_r * np.random.uniform(0.25, 0.4)
+    hole_cx = cx + np.random.uniform(-0.03, 0.03)
+    hole_cy = cy + np.random.uniform(-0.03, 0.03)
+    hole = blob(X, Y, hole_cx, hole_cy, hole_r, n_pts=6)
+    mask = mask & (~hole)
 
     return mask
-
 
 def laplace_irregular_solutions(n_samples, grid_size, return_grid = False):
     all_masks, all_u_grid = [], []
@@ -99,6 +96,7 @@ def laplace_irregular_solutions(n_samples, grid_size, return_grid = False):
 
         for _ in range(3000):
             u_new = u.copy()
+            
             u_new[1:-1,1:-1] = 0.25*(u[1:-1,2:]+u[1:-1,:-2]+u[2:,1:-1]+u[:-2,1:-1])
             u_new[border] = u[border]
             u_new[~mask] = 0.0
@@ -112,42 +110,50 @@ def laplace_irregular_solutions(n_samples, grid_size, return_grid = False):
         
         coors_i = np.concatenate([np.stack([X[iy,ix], Y[iy,ix]], -1),
                                    np.stack([X[by,bx], Y[by,bx]], -1)], 0)
-        u_i     = np.concatenate([u[iy,ix], u[by,bx]])[:,None]
-        flag_i  = np.concatenate([np.ones(len(iy)), np.zeros(len(by))])
+        u_i = np.concatenate([u[iy,ix], u[by,bx]])[:,None]
+        flag_i = np.concatenate([np.ones(len(iy)), np.zeros(len(by))])
 
-        all_coors.append(coors_i); all_u.append(u_i); all_flag.append(flag_i)
+        all_coors.append(coors_i)
+        all_u.append(u_i)
+        all_flag.append(flag_i)
 
     if return_grid:
         return all_coors, all_u, all_flag, all_masks, all_u_grid
     return all_coors, all_u, all_flag
 
+# 1 Interior, 0 Border
 def pack_dataset(all_coors, all_u, all_flag):
     datasize = len(all_coors)
 
     max_pde_nodes, max_bc_nodes = 0, 0
     for i in range(datasize):
-        max_pde_nodes = max(max_pde_nodes, int(np.sum(all_flag[i]==1)))
-        max_bc_nodes  = max(max_bc_nodes,  int(np.sum(all_flag[i]==0)))
+        max_pde_nodes = max(max_pde_nodes, int(np.sum(all_flag[i] == 1)))
+        max_bc_nodes = max(max_bc_nodes, int(np.sum(all_flag[i] == 0)))
 
     coorT, uT, flagT, parT, par_flagT = [], [], [], [], []
     for i in range(datasize):
         pde_idx = np.where(all_flag[i]==1)[0]
-        bc_idx  = np.where(all_flag[i]==0)[0]
+        bc_idx = np.where(all_flag[i]==0)[0]
         n_pde, n_bc = len(pde_idx), len(bc_idx)
 
-        coor_i = np.concatenate([all_coors[i][pde_idx], np.zeros((max_pde_nodes-n_pde,2)),
-                                  all_coors[i][bc_idx],  np.zeros((max_bc_nodes-n_bc,2))], 0)
-        u_i    = np.concatenate([all_u[i][pde_idx],      np.zeros((max_pde_nodes-n_pde,1)),
-                                  all_u[i][bc_idx],       np.zeros((max_bc_nodes-n_bc,1))], 0)
-        flag_i = np.concatenate([np.ones(n_pde), np.zeros(max_pde_nodes-n_pde),
-                                  np.ones(n_bc),  np.zeros(max_bc_nodes-n_bc)])
+        coor_i = np.concatenate([all_coors[i][pde_idx], np.zeros((max_pde_nodes - n_pde, 2)),
+                                 all_coors[i][bc_idx], np.zeros((max_bc_nodes - n_bc, 2))], 0)
+        u_i = np.concatenate([all_u[i][pde_idx], np.zeros((max_pde_nodes - n_pde, 1)),
+                              all_u[i][bc_idx], np.zeros((max_bc_nodes - n_bc, 1))], 0)
+        flag_i = np.concatenate([np.ones(n_pde), np.zeros(max_pde_nodes - n_pde), #REAL DATA
+                                 np.ones(n_bc), np.zeros(max_bc_nodes - n_bc)])
 
         par_i = np.concatenate([all_coors[i][bc_idx], all_u[i][bc_idx]], -1)
-        par_i = np.concatenate([par_i, np.zeros((max_bc_nodes-n_bc, 3))], 0)
-        par_flag_i = np.concatenate([np.ones(n_bc), np.zeros(max_bc_nodes-n_bc)])
+        par_i = np.concatenate([par_i, np.zeros((max_bc_nodes - n_bc, 3))], 0)
+        par_flag_i = np.concatenate([np.ones(n_bc), np.zeros(max_bc_nodes - n_bc)])
 
-        coorT.append(coor_i); uT.append(u_i); flagT.append(flag_i)
-        parT.append(par_i); par_flagT.append(par_flag_i)
+        coorT.append(coor_i)
+        uT.append(u_i)
+        flagT.append(flag_i)
+
+        
+        parT.append(par_i)
+        par_flagT.append(par_flag_i)
 
     return (torch.tensor(np.stack(coorT), dtype=torch.float32),
             torch.tensor(np.stack(uT), dtype=torch.float32),
@@ -160,10 +166,14 @@ def loss_function(model, bc_pts, bc_flag, query_pde, pde_flag, w_pde, w_bc):
     query_pde = query_pde.requires_grad_(True)
     u_pred = model(bc_pts, bc_flag, query_pde)
 
-    grads = torch.autograd.grad(u_pred, query_pde, torch.ones_like(u_pred), create_graph=True)[0]
-    du_dx, du_dy = grads[...,0:1], grads[...,1:2]
-    du_dxx = torch.autograd.grad(du_dx, query_pde, torch.ones_like(du_dx), create_graph=True)[0][...,0:1]
-    du_dyy = torch.autograd.grad(du_dy, query_pde, torch.ones_like(du_dy), create_graph=True)[0][...,1:2]
+    grads = torch.autograd.grad(u_pred, query_pde,
+                                torch.ones_like(u_pred),
+                                create_graph=True)[0]
+    
+    du_dx = grads[:, 0:1]
+    du_dy = grads[:, 1:2]
+    du_dxx = torch.autograd.grad(du_dx, query_pde, torch.ones_like(du_dx), create_graph=True)[0][:, 0:1]
+    du_dyy = torch.autograd.grad(du_dy, query_pde, torch.ones_like(du_dy), create_graph=True)[0][:, 1:2]
 
     residual = (du_dxx + du_dyy).squeeze(-1)
     l_pde = (residual**2 * pde_flag).sum() / pde_flag.sum().clamp(min=1)
@@ -171,16 +181,14 @@ def loss_function(model, bc_pts, bc_flag, query_pde, pde_flag, w_pde, w_bc):
     u_bc_pred = model(bc_pts, bc_flag, bc_pts[:,:,:2]).squeeze(-1)
     l_bc = ((u_bc_pred - bc_pts[:,:,2])**2 * bc_flag).sum() / bc_flag.sum().clamp(min=1)
 
-    return w_pde*l_pde + w_bc*l_bc
+    return w_pde * l_pde + w_bc * l_bc
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-
-    
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")    
 
     out_dim = 256
 
@@ -216,24 +224,28 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-5)
 
     for epoch in range(1, n_epochs + 1):
-        idx = np.random.choice(num_scenarios, batch_size, replace=False)
+        idx = np.random.choice(num_scenarios, batch_size, replace = False)
 
-        bc_pts  = parT[idx].to(device)
+        bc_pts = parT[idx].to(device)
         bc_flag = par_flagT[idx].to(device)
 
         query_pde = coorT[idx, :max_pde].to(device)
-        pde_flag  = flagT[idx, :max_pde].to(device)
+        pde_flag = flagT[idx, :max_pde].to(device)
 
         loss = loss_function(model, bc_pts, bc_flag, query_pde, pde_flag, w_pde, w_border)
 
-        optimizer.zero_grad(); loss.backward(); optimizer.step(); scheduler.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        
         if epoch % 500 == 0:
-            print(f"Epoch {epoch}, loss {loss.item():.5f}")
+            print(f"Epoch {epoch}")
 
 
+    # Testing
     np.random.seed(99)
-    all_coors_t, all_u_t, all_flag_t, all_masks_t, all_ugrid_t = laplace_irregular_solutions(
-        1, grid_size, return_grid=True)
+    all_coors_t, all_u_t, all_flag_t, all_masks_t, all_ugrid_t = laplace_irregular_solutions(1, grid_size, return_grid=True)
 
     mask = all_masks_t[0]
     sol_test = all_ugrid_t[0]
@@ -252,7 +264,7 @@ if __name__ == "__main__":
 
         pred = model(bc_pts_t, bc_flag_t, xy_t).cpu().numpy().reshape(grid_size, grid_size)
 
-    sol_masked  = np.where(mask, sol_test, np.nan)
+    sol_masked = np.where(mask, sol_test, np.nan)
     pred_masked = np.where(mask, pred, np.nan)
 
     # Plots
