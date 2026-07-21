@@ -8,22 +8,24 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
+
 import my_utils as utils
+import equation
 
 class LaplaceEquation(nn.Module):
-    def __init__(self, input_branch_dim, input_trunk_dim, out_dim):
+    def __init__(self, input_branch_dim, input_trunk_dim, out_dim, hidden_size):
         super().__init__()
-        self.branch = nn.Sequential(nn.Linear(input_branch_dim, 256),
+        self.branch = nn.Sequential(nn.Linear(input_branch_dim, hidden_size),
                                     nn.Tanh(),
-                                    nn.Linear(256, 256),
+                                    nn.Linear(hidden_size, hidden_size),
                                     nn.Tanh(),
-                                    nn.Linear(256, out_dim))
+                                    nn.Linear(hidden_size, out_dim))
         
-        self.trunk = nn.Sequential( nn.Linear(input_trunk_dim, 256),
+        self.trunk = nn.Sequential( nn.Linear(input_trunk_dim, hidden_size),
                                     nn.Tanh(),
-                                    nn.Linear(256, 256),
+                                    nn.Linear(hidden_size, hidden_size),
                                     nn.Tanh(),
-                                    nn.Linear(256, out_dim) )
+                                    nn.Linear(hidden_size, out_dim) )
         
         self.bias = nn.Parameter(torch.zeros(1))
 
@@ -38,7 +40,7 @@ def loss_function(model,
                    u_bc, y_bc, real_bc,
 
                    w_pde, w_data, w_border,
-                   current_epoch, f_source_torch):
+                   current_epoch, equation):
 
     # Loss PDE
     y_pde = y_pde.requires_grad_(True)
@@ -58,12 +60,8 @@ def loss_function(model,
 
     
     
-    if (current_epoch < 15000):
-        l_pde = torch.mean( (du_dxx + du_dyy - f_source_torch(y_pde[:,0:1], y_pde[:, 1:2]))**2 )
-    else:
-        F_SCALE = 50 * np.pi**2
-        l_pde = torch.mean( ((du_dxx + du_dyy - f_source_torch(y_pde[:,0:1], y_pde[:, 1:2])) / F_SCALE)**2 )
-        
+    
+    l_pde = torch.mean(equation.residual(du_dxx, du_dyy, y_pde, (current_epoch >= 15000))**2 )
 
     # Loss DATA
     l_data = torch.mean((model(u_data, y_data) - real_data)**2)
@@ -77,22 +75,10 @@ def loss_function(model,
     else:
         loss = w_pde * l_pde + w_data * l_data + w_border * 20 * l_border
         
-    
-    #if (current_epoch < 10000):
-    #    loss = w_data * l_data + w_border * l_border
-    #else:
-    #    loss = w_pde * l_pde + w_data * l_data + w_border * l_border
-    
-    
-    
-    
-    
     if (current_epoch % 500 == 0):
         print("loss_pde", l_pde.item())
         print("loss_data", l_data.item())
         print("loss_border", l_border.item())
-        
-    
         
     return loss
 
@@ -102,6 +88,7 @@ if __name__ == "__main__":
     
     # Parameters
     output_dim = 256
+    hidden_size = 128
 
     grid_size = 32
     num_scenarios = 1000
@@ -123,23 +110,34 @@ if __name__ == "__main__":
     # Lambda to tensor
     to_t = lambda a: torch.tensor(a, dtype=torch.float32).to(device)
 
-    # Data generation
-    print("Generating data")
-    border_data, interior_data = utils.laplace_numerical_solutions(num_scenarios, grid_size,
-                                                                   utils.sin_frontier, utils.fun_benchmark2)
-
     # Coords    
     x_coords = np.linspace(0, 1, grid_size)
     y_coords = np.linspace(0, 1, grid_size)
     
     X, Y = np.meshgrid(x_coords, y_coords)
     xy_grid = np.stack([X.ravel(), Y.ravel()], axis = 1)
+    
+    # Equations
+    zero_equation = equation.Equation(utils.fun_zeros, utils.fun_zeros_torch, xy_grid)
+    heat_equation = equation.Equation(utils.fun_calor, utils.fun_calor_torch, xy_grid)
+    electroestatica_equation = equation.Equation(utils.fun_electroestatica, utils.fun_electroestatica_torch, xy_grid)
+    benchmark_1_equation = equation.Equation(utils.fun_benchmark1, utils.fun_benchmark1_torch, xy_grid)
+    benchmark_2_equation = equation.Equation(utils.fun_benchmark2, utils.fun_benchmark2_torch, xy_grid, True)
+    
+    #CURRENT_EQ = benchmark_2_equation
+    CURRENT_EQ = zero_equation
+    # Data generation
+    print("Generating data")
+    border_data, interior_data = utils.laplace_numerical_solutions(num_scenarios, grid_size,
+                                                                   utils.sin_frontier, CURRENT_EQ.f_np)
+
+
 
     
     sol_flat = interior_data.reshape(num_scenarios, -1) # (ARRAY DE DATA) * 500
 
     # TRAINING
-    model = LaplaceEquation(input_branch_dim = 4 * grid_size, input_trunk_dim = 2, out_dim = output_dim).to(device)
+    model = LaplaceEquation(input_branch_dim = 4 * grid_size, input_trunk_dim = 2, out_dim = output_dim, hidden_size = hidden_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr = lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = n_epochs, eta_min = 1e-5)
 
@@ -212,7 +210,7 @@ if __name__ == "__main__":
                              u_data_tensor, y_data_tensor, real_data_tensor,
                              u_bc_tensor, y_bc_tensor, real_bc_tensor,
                              w_pde, w_data, w_border, epoch,
-                             utils.fun_benchmark2_torch)
+                             CURRENT_EQ)
 
         optimizer.zero_grad()
         loss.backward()
@@ -230,7 +228,7 @@ if __name__ == "__main__":
     n_test = 100
 
     
-    border_test, interior_test = utils.laplace_numerical_solutions(n_test, grid_size, utils.sin_frontier, utils.fun_benchmark2)
+    border_test, interior_test = utils.laplace_numerical_solutions(n_test, grid_size, utils.sin_frontier, CURRENT_EQ.f_np)
 
     model.eval()
     predictions = np.zeros((n_test, grid_size, grid_size))

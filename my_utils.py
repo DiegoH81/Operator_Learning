@@ -7,7 +7,6 @@ def sin_frontier(in_matrix, in_x, in_random_A, in_random_B):
     in_matrix[:, 0] = 0.0
     in_matrix[:, -1] = 0.0
     
-
 def laplace_numerical_solutions(n_samples, grid_size, f_frontier, f_source, max_iters = 5000):
 
     border_data = []
