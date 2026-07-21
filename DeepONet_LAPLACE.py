@@ -3,23 +3,27 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
 import my_utils as utils
 
 class LaplaceEquation(nn.Module):
     def __init__(self, input_branch_dim, input_trunk_dim, out_dim):
         super().__init__()
-        self.branch = nn.Sequential(nn.Linear(input_branch_dim, 128),
+        self.branch = nn.Sequential(nn.Linear(input_branch_dim, 256),
                                     nn.Tanh(),
-                                    nn.Linear(128, 128),
+                                    nn.Linear(256, 256),
                                     nn.Tanh(),
-                                    nn.Linear(128, out_dim))
+                                    nn.Linear(256, out_dim))
         
-        self.trunk = nn.Sequential( nn.Linear(input_trunk_dim, 128),
+        self.trunk = nn.Sequential( nn.Linear(input_trunk_dim, 256),
                                     nn.Tanh(),
-                                    nn.Linear(128, 128),
+                                    nn.Linear(256, 256),
                                     nn.Tanh(),
-                                    nn.Linear(128, out_dim) )
+                                    nn.Linear(256, out_dim) )
         
         self.bias = nn.Parameter(torch.zeros(1))
 
@@ -52,8 +56,14 @@ def loss_function(model,
                                  grad_outputs = torch.ones_like(du_dy),
                                  create_graph = True)[0][:, 1:2]
 
-    l_pde = torch.mean( (du_dxx + du_dyy - f_source_torch(y_pde[:,0:1], y_pde[:, 1:2]))**2 )
-
+    
+    
+    if (current_epoch < 15000):
+        l_pde = torch.mean( (du_dxx + du_dyy - f_source_torch(y_pde[:,0:1], y_pde[:, 1:2]))**2 )
+    else:
+        F_SCALE = 50 * np.pi**2
+        l_pde = torch.mean( ((du_dxx + du_dyy - f_source_torch(y_pde[:,0:1], y_pde[:, 1:2])) / F_SCALE)**2 )
+        
 
     # Loss DATA
     l_data = torch.mean((model(u_data, y_data) - real_data)**2)
@@ -62,10 +72,27 @@ def loss_function(model,
     # Loss Border
     l_border = torch.mean((model(u_bc, y_bc) - real_bc)**2)
 
-    if (current_epoch < 10000):
-        loss = w_data * l_data
-    else:
+    if current_epoch < 15000:
         loss = w_pde * l_pde + w_data * l_data + w_border * l_border
+    else:
+        loss = w_pde * l_pde + w_data * l_data + w_border * 20 * l_border
+        
+    
+    #if (current_epoch < 10000):
+    #    loss = w_data * l_data + w_border * l_border
+    #else:
+    #    loss = w_pde * l_pde + w_data * l_data + w_border * l_border
+    
+    
+    
+    
+    
+    if (current_epoch % 500 == 0):
+        print("loss_pde", l_pde.item())
+        print("loss_data", l_data.item())
+        print("loss_border", l_border.item())
+        
+    
         
     return loss
 
@@ -80,13 +107,14 @@ if __name__ == "__main__":
     num_scenarios = 1000
 
     batch_size = 128
-    n_col = 100
-    n_data = 200
+    n_col = 200
+    n_data = 500
 
     lr = 1e-3
     n_epochs = 25000
 
-    w_pde, w_data, w_border = 5.0, 10.0, 5.0
+    w_pde, w_data, w_border = 8.0, 10.0, 10.0
+    
 
     torch.manual_seed(0)
     np.random.seed(0)
@@ -98,7 +126,7 @@ if __name__ == "__main__":
     # Data generation
     print("Generating data")
     border_data, interior_data = utils.laplace_numerical_solutions(num_scenarios, grid_size,
-                                                                   utils.sin_frontier, utils.fun_zeros)
+                                                                   utils.sin_frontier, utils.fun_benchmark2)
 
     # Coords    
     x_coords = np.linspace(0, 1, grid_size)
@@ -119,6 +147,10 @@ if __name__ == "__main__":
     print("\nStarting training")
     for epoch in range(1, n_epochs + 1):
 
+        if epoch == 15000:
+            optimizer = optim.Adam(model.parameters(), lr=5e-4)  # LR fresco para fase 2
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000, eta_min=1e-5)
+        
         # Batch Data
         idx_selected = np.random.choice(num_scenarios, batch_size, replace = False)
         u_batch = border_data[idx_selected]
@@ -180,11 +212,11 @@ if __name__ == "__main__":
                              u_data_tensor, y_data_tensor, real_data_tensor,
                              u_bc_tensor, y_bc_tensor, real_bc_tensor,
                              w_pde, w_data, w_border, epoch,
-                             utils.fun_zeros_torch)
+                             utils.fun_benchmark2_torch)
 
         optimizer.zero_grad()
         loss.backward()
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
@@ -198,7 +230,7 @@ if __name__ == "__main__":
     n_test = 100
 
     
-    border_test, interior_test = utils.laplace_numerical_solutions(n_test, grid_size, utils.sin_frontier, utils.fun_zeros)
+    border_test, interior_test = utils.laplace_numerical_solutions(n_test, grid_size, utils.sin_frontier, utils.fun_benchmark2)
 
     model.eval()
     predictions = np.zeros((n_test, grid_size, grid_size))
@@ -220,7 +252,7 @@ if __name__ == "__main__":
         pred_i = predictions[i]
 
         l2_rel = np.linalg.norm(pred_i - true_i) / np.linalg.norm(true_i)
-        rmse_error = np.sum(np.sqrt((pred_i - true_i)**2))/ (grid_size * grid_size)
+        rmse_error = np.sqrt(np.mean((pred_i - true_i)**2))
         max_err = np.abs(pred_i - true_i).max()
 
         l2_errors.append(l2_rel)
